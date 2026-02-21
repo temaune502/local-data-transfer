@@ -1,60 +1,48 @@
 """
-transfer.py  v4
+transfer.py  v5
 ───────────────
 Enhanced P2P transfer engine.
+
+Memory model
+────────────
+  Sender  : reads file in CHUNK_SIZE slices; at most MAX_PARALLEL*2 compressed
+            chunks live in RAM at once (bounded by a Semaphore). The entire
+            file is never loaded into memory.
+  Receiver: decompressed chunks are written to per-session temp files;
+            the in-memory dict is replaced by a set of received indices.
+            Finalization streams from temp files – only one chunk in RAM
+            at a time.
 
 Features
 ────────
   • zlib compression per chunk (level 6)
-  • Parallel chunk streams over MAX_PARALLEL simultaneous TCP connections
-  • SHA-256 integrity: per-chunk  +  full-file
-  • Single-file: split → compress → stream in parallel
-  • Folder: walk files, split ALL chunks from ALL files, stream ALL in parallel
-    (no ZIP archiving – direct chunked streaming per file)
-  • Dual-sided progress callbacks (sender & receiver)
+  • Parallel chunk streams (MAX_PARALLEL TCP connections)
+  • SHA-256: per-chunk integrity + full-file integrity (streaming on sender)
+  • Folder: walk files, stream ALL chunks in parallel (no ZIP)
+  • Dual-sided progress callbacks
 
-Protocol (binary framing)
-──────────────────────────
-  [4B] header length  (big-endian uint32)
-  [NB] JSON header    (UTF-8)
-  [MB] payload        (absent for session_init / message)
+Protocol
+────────
+  [4B uint32 big-endian] header length
+  [N bytes UTF-8 JSON]   header
+  [M bytes]              payload (chunks only)
 
-Header types
-────────────
-  session_init  – opens a new file transfer session on receiver
-  chunk         – one compressed chunk for a session
-  message       – plain UTF-8 text
-
-session_init fields
-───────────────────
-  {
-    "type":          "session_init",
-    "session_id":    <uuid4 str>,
-    "sender":        <node name>,
-    "rel_path":      <forward-slash relative save path>,  e.g. "folder/sub/file.txt"
-    "original_size": <int bytes>,
-    "total_chunks":  <int>,
-    "sha256":        <hex str – full file>
-  }
-
-chunk fields
-────────────
-  {
-    "type":            "chunk",
-    "session_id":      <uuid4 str>,
-    "index":           <int>,
-    "sha256":          <hex str – compressed chunk>,
-    "compressed_size": <int>
-  }
-  + payload: raw compressed bytes
+  session_init  { type, session_id, sender, rel_path,
+                  original_size, total_chunks, sha256 }
+  chunk         { type, session_id, index, sha256, compressed_size }
+                + payload
+  message       { type, sender, text }
 """
 
 import hashlib
 import json
 import logging
+import math
 import os
+import shutil
 import socket
 import struct
+import tempfile
 import threading
 import time
 import uuid
@@ -64,17 +52,32 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE     = 2 * 1024 * 1024   # 2 MiB uncompressed per chunk
-MAX_PARALLEL   = 4                  # simultaneous TCP connections
-CONNECT_TIMEOUT = 10               # seconds
+CHUNK_SIZE      = 2 * 1024 * 1024   # 2 MiB per chunk (uncompressed)
+MAX_PARALLEL    = 4                  # simultaneous TCP chunk connections
+# At most MAX_PARALLEL * 2 compressed chunks live in RAM simultaneously.
+# Peak sender RAM ≈ MAX_PARALLEL * 2 * CHUNK_SIZE * compression_ratio ≈ 8 MB
+_MAX_INFLIGHT   = MAX_PARALLEL * 2
+CONNECT_TIMEOUT = 10                 # seconds
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
 #  Utilities                                                                   #
 # ──────────────────────────────────────────────────────────────────────────── #
 
-def _sha256(data: bytes) -> str:
+def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    """Stream a file and return its SHA-256 without loading it entirely."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(1 << 20)   # 1 MiB read window
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
 
 
 def fmt_size(n: int) -> str:
@@ -94,6 +97,19 @@ def _unique_path(path: Path) -> Path:
         if not cand.exists():
             return cand
     return path
+
+
+def _sanitise_rel_path(raw: str) -> str:
+    """
+    Normalise a relative path received over the network.
+    Strips leading slashes, dots, and any path-traversal components.
+    """
+    parts = []
+    for part in raw.replace("\\", "/").split("/"):
+        part = part.strip()
+        if part and part != "." and part != "..":
+            parts.append(part)
+    return "/".join(parts) if parts else "unknown_file"
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -121,39 +137,24 @@ def _recv_header(sock: socket.socket) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-#  Chunking                                                                    #
-# ──────────────────────────────────────────────────────────────────────────── #
-
-# Chunk tuple: (index, compressed_bytes, sha256_of_compressed, original_size)
-ChunkTuple = tuple[int, bytes, str, int]
-
-
-def _prepare_chunks(data: bytes) -> list[ChunkTuple]:
-    """Split, compress, hash.  Returns list of (idx, compressed, sha, orig_size)."""
-    result: list[ChunkTuple] = []
-    total = len(data)
-    for i in range(0, max(total, 1), CHUNK_SIZE):
-        raw  = data[i : i + CHUNK_SIZE]
-        comp = zlib.compress(raw, level=6)
-        result.append((i // CHUNK_SIZE, comp, _sha256(comp), len(raw)))
-    return result
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
-#  Receiver: Session Buffer                                                    #
+#  Receiver: Session                                                           #
 # ──────────────────────────────────────────────────────────────────────────── #
 
 class _Session:
     """
-    Accumulates compressed chunks for one file.
-    On completion: decompresses + reassembles + verifies SHA-256 + saves.
+    Accumulates chunks for one file transfer on the receiver side.
+
+    Each decompressed chunk is immediately written to a temp file so that
+    RAM usage stays bounded regardless of file size.  Finalization streams
+    from those temp files, verifies the full-file SHA-256, and writes the
+    final output – at most one chunk in RAM at a time.
     """
 
     def __init__(self, *, session_id: str, rel_path: str,
                  total_chunks: int, original_size: int, full_sha256: str,
                  save_dir: Path, sender_name: str, on_complete, on_progress):
         self.session_id    = session_id
-        self.rel_path      = rel_path          # forward-slash relative path
+        self.rel_path      = rel_path
         self.display_name  = Path(rel_path).name
         self.total_chunks  = total_chunks
         self.original_size = original_size
@@ -163,28 +164,40 @@ class _Session:
         self._on_complete  = on_complete
         self._on_progress  = on_progress
 
-        self._chunks: dict[int, bytes] = {}
-        self._recv_bytes  = 0
-        self._lock        = threading.Lock()
-        self._created_at  = time.time()
+        # Received chunk indices (lightweight, just ints)
+        self._received: set[int] = set()
+        self._recv_bytes = 0
+        self._lock       = threading.Lock()
+        self._created_at = time.time()
+
+        # Each chunk is stored as a separate temp file: <tmp_dir>/<index:08d>.chunk
+        self._tmp_dir = Path(tempfile.mkdtemp(prefix="ldt_rx_"))
+
+    # ── public ─────────────────────────────────────────────────────────── #
 
     def add_chunk(self, index: int, compressed: bytes, chunk_sha256: str):
         # Per-chunk integrity
-        actual = _sha256(compressed)
+        actual = _sha256_bytes(compressed)
         if actual != chunk_sha256:
             raise ValueError(
                 f"Chunk {index} SHA-256 mismatch for {self.display_name}\n"
                 f"  expected {chunk_sha256[:12]}…  got {actual[:12]}…"
             )
 
+        # Deduplicate before decompression
+        with self._lock:
+            if index in self._received:
+                return
+            self._received.add(index)
+
+        # Decompress and persist to temp file (outside the lock – CPU+IO)
         decompressed = zlib.decompress(compressed)
+        chunk_file = self._tmp_dir / f"{index:08d}.chunk"
+        chunk_file.write_bytes(decompressed)
 
         with self._lock:
-            if index in self._chunks:
-                return                    # duplicate – skip
-            self._chunks[index] = decompressed
             self._recv_bytes += len(decompressed)
-            count = len(self._chunks)
+            count = len(self._received)
             rb    = self._recv_bytes
 
         if self._on_progress:
@@ -196,33 +209,43 @@ class _Session:
         if count == self.total_chunks:
             threading.Thread(target=self._finalize, daemon=True).start()
 
-    def _finalize(self):
-        try:
-            data = b"".join(self._chunks[i] for i in range(self.total_chunks))
+    # ── private ────────────────────────────────────────────────────────── #
 
-            actual = _sha256(data)
+    def _finalize(self):
+        out_path = None
+        try:
+            out_path = _unique_path(self.save_dir / Path(self.rel_path))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Stream temp chunks → output file, computing SHA-256 incrementally
+            hasher = hashlib.sha256()
+            with open(out_path, "wb") as out_f:
+                for i in range(self.total_chunks):
+                    chunk_data = (self._tmp_dir / f"{i:08d}.chunk").read_bytes()
+                    hasher.update(chunk_data)
+                    out_f.write(chunk_data)
+
+            # Full-file integrity check
+            actual = hasher.hexdigest()
             if actual != self.full_sha256:
+                out_path.unlink(missing_ok=True)
                 raise ValueError(
                     f"Full-file SHA-256 mismatch for {self.display_name}!\n"
-                    f"  expected {self.full_sha256[:16]}…  got {actual[:16]}…"
+                    f"  expected {self.full_sha256[:20]}…\n"
+                    f"  got      {actual[:20]}…"
                 )
-
-            # Build output path, preserving folder structure
-            out = _unique_path(self.save_dir / Path(self.rel_path))
-            out.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(out, "wb") as f:
-                f.write(data)
 
             elapsed = max(time.time() - self._created_at, 1e-6)
             speed   = self.original_size / elapsed
             self._on_complete(
                 self.session_id, self.sender_name,
-                str(out), elapsed, speed, self.original_size,
+                str(out_path), elapsed, speed, self.original_size,
             )
 
         except Exception as exc:
             logger.error(f"[Session {self.session_id[:8]}] finalize error: {exc}")
+        finally:
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -251,26 +274,42 @@ def _do_send_chunk(peer_ip: str, peer_port: int,
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-#  Core: send one logical data block (used by both file and folder paths)      #
+#  File task metadata (no file content stored)                                 #
 # ──────────────────────────────────────────────────────────────────────────── #
 
 class _FileTask:
-    """Everything needed to send one file as a session."""
-    __slots__ = ("session_id", "rel_path", "data", "full_sha", "chunks")
+    """
+    Lightweight descriptor for one file to send.
 
-    def __init__(self, rel_path: str, data: bytes):
-        self.session_id = str(uuid.uuid4())
-        self.rel_path   = rel_path
-        self.data       = data
-        self.full_sha   = _sha256(data)
-        self.chunks     = _prepare_chunks(data)
+    The file content is NOT loaded here.  SHA-256 is computed in a single
+    streaming pass.  Actual chunk data is read lazily during dispatch.
+    """
+    __slots__ = ("session_id", "rel_path", "path",
+                 "file_size", "total_chunks", "full_sha")
+
+    def __init__(self, rel_path: str, path: Path):
+        self.session_id   = str(uuid.uuid4())
+        self.rel_path     = rel_path
+        self.path         = path
+        self.file_size    = path.stat().st_size
+        self.total_chunks = (
+            max(1, math.ceil(self.file_size / CHUNK_SIZE))
+            if self.file_size > 0 else 1
+        )
+        # One streaming pass – no file content kept in RAM
+        self.full_sha = _sha256_file(path)
 
 
-def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list[_FileTask],
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Core dispatch (streaming, bounded memory)                                   #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list,
                     sender_name: str, total_bytes: int, progress_cb=None):
     """
-    1. Send session_init for every task.
-    2. Dispatch ALL chunks from ALL tasks in parallel (MAX_PARALLEL workers).
+    1. Send session_init for every task (small, fast).
+    2. Stream each file's chunks in parallel, bounded by a semaphore so that
+       at most _MAX_INFLIGHT compressed chunks exist in RAM simultaneously.
     """
     # ── 1. Announce all sessions ──
     for t in tasks:
@@ -279,35 +318,64 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list[_FileTask],
             "session_id":    t.session_id,
             "sender":        sender_name,
             "rel_path":      t.rel_path,
-            "original_size": len(t.data),
-            "total_chunks":  len(t.chunks),
+            "original_size": t.file_size,
+            "total_chunks":  t.total_chunks,
             "sha256":        t.full_sha,
         })
-        time.sleep(0.05)        # give receiver a moment per session_init
+        # Small pause per session; receiver pending-buffer handles any race.
+        time.sleep(0.04)
 
-    # ── 2. Flatten all chunks, dispatch in parallel ──
-    # NOTE: no sleep needed – receiver buffers chunks that arrive before
-    #       session_init and replays them automatically.
-    work = []                   # (session_id, idx, comp, sha, orig_size)
-    for t in tasks:
-        for idx, comp, sha, orig in t.chunks:
-            work.append((t.session_id, idx, comp, sha, orig))
-
+    # ── 2. Bounded-memory parallel chunk streaming ──
     sent = [0]
-    lock = threading.Lock()
-
-    def dispatch(item):
-        sid, idx, comp, sha, orig = item
-        _do_send_chunk(peer_ip, peer_port, sid, idx, comp, sha)
-        with lock:
-            sent[0] = min(sent[0] + orig, total_bytes)
-            if progress_cb:
-                progress_cb(sent[0], total_bytes)
+    lock     = threading.Lock()
+    inflight = threading.Semaphore(_MAX_INFLIGHT)   # bounds RAM
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
-        futures = [pool.submit(dispatch, w) for w in work]
-        for f in as_completed(futures):
-            exc = f.exception()
+        futures = []
+
+        for t in tasks:
+            if t.file_size == 0:
+                # Empty file: send one empty compressed chunk
+                inflight.acquire()
+                comp = zlib.compress(b"", level=6)
+                sha  = _sha256_bytes(comp)
+
+                def _empty(sid=t.session_id, c=comp, s=sha):
+                    try:
+                        _do_send_chunk(peer_ip, peer_port, sid, 0, c, s)
+                    finally:
+                        inflight.release()
+
+                futures.append(pool.submit(_empty))
+            else:
+                with open(t.path, "rb") as f:
+                    idx = 0
+                    while True:
+                        inflight.acquire()
+                        raw = f.read(CHUNK_SIZE)
+                        if not raw:
+                            inflight.release()
+                            break
+                        comp = zlib.compress(raw, level=6)
+                        sha  = _sha256_bytes(comp)
+                        orig = len(raw)
+
+                        def _chunk(sid=t.session_id, i=idx,
+                                   c=comp, s=sha, o=orig):
+                            try:
+                                _do_send_chunk(peer_ip, peer_port, sid, i, c, s)
+                                with lock:
+                                    sent[0] = min(sent[0] + o, total_bytes)
+                                    if progress_cb:
+                                        progress_cb(sent[0], total_bytes)
+                            finally:
+                                inflight.release()
+
+                        futures.append(pool.submit(_chunk))
+                        idx += 1
+
+        for fut in as_completed(futures):
+            exc = fut.exception()
             if exc:
                 raise exc
 
@@ -319,27 +387,24 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list[_FileTask],
 def send_file(peer_ip: str, peer_port: int, filepath: str,
               sender_name: str, progress_cb=None):
     """
-    Send a single file.
+    Send a single file using streaming I/O.
+    RAM usage: O(MAX_PARALLEL * CHUNK_SIZE) regardless of file size.
     progress_cb(bytes_sent, total_bytes)
     """
     path = Path(filepath)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {filepath}")
-    data = path.read_bytes()
-    task = _FileTask(path.name, data)
+    task = _FileTask(path.name, path)
     _dispatch_tasks(peer_ip, peer_port, [task], sender_name,
-                    len(data), progress_cb)
-    logger.info(f"File sent: {path.name}  {fmt_size(len(data))}")
+                    task.file_size, progress_cb)
+    logger.info(f"File sent: {path.name}  {fmt_size(task.file_size)}")
 
 
 def send_folder(peer_ip: str, peer_port: int, folder_path: str,
                 sender_name: str, progress_cb=None):
     """
-    Send an entire folder without zipping.
-
-    Every file is split into chunks, compressed, and ALL chunks from ALL
-    files are dispatched in parallel (bounded by MAX_PARALLEL connections).
-
+    Send an entire folder using streaming I/O per file.
+    Each file is chunked, compressed, and streamed in parallel.
     The receiver recreates the full folder tree under received/<folder_name>/.
     progress_cb(bytes_sent, total_bytes)
     """
@@ -351,27 +416,24 @@ def send_folder(peer_ip: str, peer_port: int, folder_path: str,
     if not all_files:
         raise ValueError(f"Folder is empty: {folder_path}")
 
-    # Build tasks – rel_path is relative to folder's PARENT so that the
-    # folder name itself is preserved on the receiver side.
-    tasks: list[_FileTask] = []
+    tasks = []
     for file in all_files:
-        rel = "/".join(file.relative_to(folder.parent).parts)   # forward slashes
-        data = file.read_bytes()
-        tasks.append(_FileTask(rel, data))
+        # rel_path preserves folder name as first component
+        rel = "/".join(file.relative_to(folder.parent).parts)
+        tasks.append(_FileTask(rel, file))
 
-    total_bytes = sum(len(t.data) for t in tasks)
+    total_bytes = sum(t.file_size for t in tasks)
     logger.info(
         f"Sending folder {folder.name!r}  "
         f"{len(tasks)} file(s)  {fmt_size(total_bytes)}"
     )
-
     _dispatch_tasks(peer_ip, peer_port, tasks, sender_name,
                     total_bytes, progress_cb)
     logger.info(f"Folder sent: {folder.name}")
 
 
 def send_message(peer_ip: str, peer_port: int, text: str, sender_name: str):
-    """Send a plain text message."""
+    """Send a plain UTF-8 text message."""
     header = {"type": "message", "text": text, "sender": sender_name}
     with socket.create_connection((peer_ip, peer_port), timeout=CONNECT_TIMEOUT) as s:
         _send_frame(s, header)
@@ -383,12 +445,17 @@ def send_message(peer_ip: str, peer_port: int, text: str, sender_name: str):
 
 class TransferServer:
     """
-    Listens on a TCP port and handles incoming connections.
+    TCP server that handles incoming transfers.
 
     Dispatches by header "type":
-      session_init  → registers a new _Session
-      chunk         → delivers compressed data to the correct session
+      session_init  → registers a new _Session (or replays buffered chunks)
+      chunk         → delivers one chunk to the session (or buffers it)
       message       → calls on_message immediately
+
+    Race-condition safety
+    ─────────────────────
+    Chunks that arrive before their session_init are stored in _pending and
+    replayed the moment the session is registered.  No timing assumptions.
 
     Callbacks
     ---------
@@ -409,15 +476,15 @@ class TransferServer:
         self._on_file             = on_file
         self._on_receive_progress = on_receive_progress
 
-        self._sessions: dict[str, _Session] = {}
-        # Chunks that arrived before their session_init was registered.
-        # keyed by session_id → list of (index, compressed, sha256)
-        self._pending: dict[str, list[tuple[int, bytes, str]]] = {}
+        self._sessions: dict[str, _Session]                    = {}
+        self._pending:  dict[str, list[tuple[int, bytes, str]]] = {}
         self._sess_lock = threading.Lock()
 
         self._running = False
-        self._sock: socket.socket | None = None
+        self._sock: socket.socket | None    = None
         self._thread: threading.Thread | None = None
+
+    # ── lifecycle ──────────────────────────────────────────────────────── #
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -426,7 +493,7 @@ class TransferServer:
         self._sock.listen(64)
         self._sock.settimeout(1.0)
         self._running = True
-        self._thread = threading.Thread(
+        self._thread  = threading.Thread(
             target=self._accept_loop, name="TCPAccept", daemon=True
         )
         self._thread.start()
@@ -439,8 +506,14 @@ class TransferServer:
                 self._sock.close()
             except Exception:
                 pass
+        # Clean up any orphaned temp dirs from incomplete sessions
+        with self._sess_lock:
+            for session in self._sessions.values():
+                shutil.rmtree(session._tmp_dir, ignore_errors=True)
+            self._sessions.clear()
+            self._pending.clear()
 
-    # ── internal ────────────────────────────────────────────────────────── #
+    # ── internal ───────────────────────────────────────────────────────── #
 
     def _accept_loop(self):
         while self._running:
@@ -475,9 +548,9 @@ class TransferServer:
 
     def _h_session_init(self, hdr: dict, sender_ip: str):
         sid      = hdr["session_id"]
-        rel_path = hdr.get("rel_path", hdr.get("filename", "unknown_file"))
-        # Sanitise: forward slashes, no path traversal
-        rel_path = rel_path.replace("\\", "/").lstrip("/").lstrip("../")
+        rel_path = _sanitise_rel_path(
+            hdr.get("rel_path", hdr.get("filename", "unknown_file"))
+        )
 
         session = _Session(
             session_id    = sid,
@@ -490,20 +563,22 @@ class TransferServer:
             on_complete   = self._on_done,
             on_progress   = self._on_receive_progress,
         )
+
         with self._sess_lock:
             self._sessions[sid] = session
-            # Replay any chunks that arrived before this session_init
             buffered = self._pending.pop(sid, [])
-        logger.debug(
-            f"Session registered {sid[:8]}…  {rel_path}"
-            + (f"  (replaying {len(buffered)} buffered chunk(s))" if buffered else "")
-        )
-        # Process buffered chunks outside the lock
+
+        tag = f"  (replaying {len(buffered)} buffered chunk(s))" if buffered else ""
+        logger.debug(f"Session registered {sid[:8]}…  {rel_path}{tag}")
+
+        # Replay early-arriving chunks (outside lock – CPU/IO work)
         for b_idx, b_comp, b_sha in buffered:
             try:
                 session.add_chunk(b_idx, b_comp, b_sha)
             except Exception as exc:
-                logger.error(f"Buffered chunk error {sid[:8]} idx={b_idx}: {exc}")
+                logger.error(
+                    f"Buffered chunk error  session={sid[:8]}  idx={b_idx}: {exc}"
+                )
 
     def _h_chunk(self, conn: socket.socket, hdr: dict, sender_ip: str):
         sid  = hdr["session_id"]
@@ -511,17 +586,23 @@ class TransferServer:
         size = int(hdr["compressed_size"])
         sha  = hdr["sha256"]
 
-        compressed = _recv_exact(conn, size)
+        compressed = _recv_exact(conn, size)   # read payload before acquiring lock
 
         with self._sess_lock:
             session = self._sessions.get(sid)
             if session is None:
-                # session_init not yet received – buffer the chunk
+                # Session not registered yet – buffer chunk for later replay
                 self._pending.setdefault(sid, []).append((idx, compressed, sha))
-                logger.debug(f"Chunk #{idx} buffered (session {sid[:8]}… not yet registered)")
+                logger.debug(
+                    f"Chunk #{idx} buffered  session={sid[:8]}… not yet registered"
+                )
                 return
 
-        session.add_chunk(idx, compressed, sha)
+        # Deliver outside the lock (CPU/IO intensive)
+        try:
+            session.add_chunk(idx, compressed, sha)
+        except Exception as exc:
+            logger.error(f"add_chunk error  session={sid[:8]}  idx={idx}: {exc}")
 
     def _on_done(self, session_id: str, sender_name: str,
                  path: str, elapsed: float, speed: float, size: int):
