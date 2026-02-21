@@ -1,5 +1,5 @@
 """
-main.py  v2
+main.py  v3
 ───────────
 Interactive CLI for LDT – LAN Data Transfer.
 
@@ -196,7 +196,11 @@ def cmd_send(pm: PeerManager, node_name: str):
             return
 
         name = os.path.basename(path.rstrip("/\\"))
-        print(f"  Zipping and sending folder {_c(name, CYAN)} → {_c(peer.name, BOLD)} …")
+        file_count = sum(1 for f in __import__('pathlib').Path(path).rglob('*') if __import__('pathlib').Path(f).is_file())
+        total_sz   = sum(f.stat().st_size for f in __import__('pathlib').Path(path).rglob('*') if f.is_file())
+        print(f"  Sending folder {_c(name, CYAN)}  "
+              f"{_c(file_count, BOLD)} file(s)  {fmt_size(total_sz)}  → {_c(peer.name, BOLD)} …")
+        print(f"  {DIM}(chunked parallel streaming – no archive created){RESET}")
 
         def progress(sent, total):
             pct = min(sent * 100 // total, 100) if total else 0
@@ -238,7 +242,7 @@ def cmd_help():
     print(f"  {DIM}• zlib compression (level 6) per chunk{RESET}")
     print(f"  {DIM}• 4 parallel chunk streams{RESET}")
     print(f"  {DIM}• SHA-256 integrity: per-chunk + full-file{RESET}")
-    print(f"  {DIM}• Folder support (auto-zip / auto-extract){RESET}")
+    print(f"  {DIM}• Folder: per-file chunked parallel streaming (no zip){RESET}")
     print(f"  {DIM}• Received files saved to: received/{RESET}")
     _sep()
 
@@ -246,7 +250,7 @@ def cmd_help():
 # ─────────────────────────────────── main ────────────────────────────────── #
 
 def main():
-    parser = argparse.ArgumentParser(description="LDT – LAN Data Transfer v2")
+    parser = argparse.ArgumentParser(description="LDT – LAN Data Transfer v3")
     parser.add_argument("--name", default=None, help="Node name (default: hostname)")
     parser.add_argument("--port", type=int, default=9000, help="TCP port (default: 9000)")
     args = parser.parse_args()
@@ -262,7 +266,7 @@ def main():
     print(_c("  ██║     ██║  ██║   ██║   ", CYAN, bold=True))
     print(_c("  ███████╗██████╔╝   ██║   ", CYAN, bold=True))
     print(_c("  ╚══════╝╚═════╝    ╚═╝   ", CYAN, bold=True))
-    print(_c("  LAN Data Transfer  v2", bold=True))
+    print(_c("  LAN Data Transfer  v3", bold=True))
     print()
     print(f"  {BOLD}Node :{RESET}  {_c(node_name, CYAN, bold=True)}")
     print(f"  {BOLD}Port :{RESET}  {tcp_port}")
