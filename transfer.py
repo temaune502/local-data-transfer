@@ -1,5 +1,5 @@
 """
-transfer.py  v3
+transfer.py  v4
 ───────────────
 Enhanced P2P transfer engine.
 
@@ -283,11 +283,11 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list[_FileTask],
             "total_chunks":  len(t.chunks),
             "sha256":        t.full_sha,
         })
-        time.sleep(0.05)        # give receiver time to register each session
-
-    time.sleep(0.15)            # short pause before flooding chunks
+        time.sleep(0.05)        # give receiver a moment per session_init
 
     # ── 2. Flatten all chunks, dispatch in parallel ──
+    # NOTE: no sleep needed – receiver buffers chunks that arrive before
+    #       session_init and replays them automatically.
     work = []                   # (session_id, idx, comp, sha, orig_size)
     for t in tasks:
         for idx, comp, sha, orig in t.chunks:
@@ -410,6 +410,9 @@ class TransferServer:
         self._on_receive_progress = on_receive_progress
 
         self._sessions: dict[str, _Session] = {}
+        # Chunks that arrived before their session_init was registered.
+        # keyed by session_id → list of (index, compressed, sha256)
+        self._pending: dict[str, list[tuple[int, bytes, str]]] = {}
         self._sess_lock = threading.Lock()
 
         self._running = False
@@ -489,7 +492,18 @@ class TransferServer:
         )
         with self._sess_lock:
             self._sessions[sid] = session
-        logger.debug(f"Session registered {sid[:8]}…  {rel_path}")
+            # Replay any chunks that arrived before this session_init
+            buffered = self._pending.pop(sid, [])
+        logger.debug(
+            f"Session registered {sid[:8]}…  {rel_path}"
+            + (f"  (replaying {len(buffered)} buffered chunk(s))" if buffered else "")
+        )
+        # Process buffered chunks outside the lock
+        for b_idx, b_comp, b_sha in buffered:
+            try:
+                session.add_chunk(b_idx, b_comp, b_sha)
+            except Exception as exc:
+                logger.error(f"Buffered chunk error {sid[:8]} idx={b_idx}: {exc}")
 
     def _h_chunk(self, conn: socket.socket, hdr: dict, sender_ip: str):
         sid  = hdr["session_id"]
@@ -501,10 +515,11 @@ class TransferServer:
 
         with self._sess_lock:
             session = self._sessions.get(sid)
-
-        if session is None:
-            logger.warning(f"Chunk #{idx} for unknown session {sid[:8]}… from {sender_ip}")
-            return
+            if session is None:
+                # session_init not yet received – buffer the chunk
+                self._pending.setdefault(sid, []).append((idx, compressed, sha))
+                logger.debug(f"Chunk #{idx} buffered (session {sid[:8]}… not yet registered)")
+                return
 
         session.add_chunk(idx, compressed, sha)
 
