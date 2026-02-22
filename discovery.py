@@ -16,6 +16,7 @@ import json
 import threading
 import time
 import logging
+from typing import Set
 
 logger = logging.getLogger(__name__)
 
@@ -141,13 +142,25 @@ class DiscoveryService:
             logger.debug(f"Bad discovery packet from {sender_ip}: {exc}")
 
 
-def _local_ips() -> set[str]:
-    """Return all IP addresses assigned to this machine."""
-    ips: set[str] = {"127.0.0.1"}
+# Module-level cache so getaddrinfo() is not called on every UDP packet
+_ips_cache: Set[str] = set()
+_ips_ts: float = 0.0
+_IPS_TTL = 60.0   # refresh once per minute
+
+
+def _local_ips() -> Set[str]:
+    """Return all IP addresses assigned to this machine (cached, TTL=60 s)."""
+    global _ips_cache, _ips_ts
+    now = time.time()
+    if now - _ips_ts < _IPS_TTL:
+        return _ips_cache
+    ips: Set[str] = {"127.0.0.1"}
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None):
             ips.add(info[4][0])
     except Exception:
         pass
+    _ips_cache = ips
+    _ips_ts    = now
     return ips

@@ -1,5 +1,5 @@
 """
-transfer.py  v5
+transfer.py  v6
 ───────────────
 Enhanced P2P transfer engine.
 
@@ -38,7 +38,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import shutil
 import socket
 import struct
@@ -58,6 +57,13 @@ MAX_PARALLEL    = 4                  # simultaneous TCP chunk connections
 # Peak sender RAM ≈ MAX_PARALLEL * 2 * CHUNK_SIZE * compression_ratio ≈ 8 MB
 _MAX_INFLIGHT   = MAX_PARALLEL * 2
 CONNECT_TIMEOUT = 10                 # seconds
+
+CHUNK_RETRIES       = 3     # retry attempts per chunk on network error
+CHUNK_RETRY_DELAY   = 0.5  # base delay (seconds); multiplied by attempt number
+
+# Pending-chunk buffer limits (guard against rogue/slow senders)
+MAX_PENDING_PER_SESSION = 256   # max buffered chunks per unknown session_id
+PENDING_TTL             = 60.0  # seconds before orphan pending entries expire
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -254,13 +260,13 @@ class _Session:
 
 def _do_send_session_init(peer_ip: str, peer_port: int, header: dict):
     with socket.create_connection((peer_ip, peer_port), timeout=CONNECT_TIMEOUT) as s:
-        raw = json.dumps(header).encode()
-        s.sendall(struct.pack(">I", len(raw)) + raw)
+        _send_frame(s, header)
 
 
 def _do_send_chunk(peer_ip: str, peer_port: int,
                    session_id: str, index: int,
                    compressed: bytes, sha256: str):
+    """Send one chunk, retrying up to CHUNK_RETRIES times on network errors."""
     header = {
         "type":            "chunk",
         "session_id":      session_id,
@@ -268,9 +274,23 @@ def _do_send_chunk(peer_ip: str, peer_port: int,
         "sha256":          sha256,
         "compressed_size": len(compressed),
     }
-    with socket.create_connection((peer_ip, peer_port), timeout=CONNECT_TIMEOUT) as s:
-        raw = json.dumps(header).encode()
-        s.sendall(struct.pack(">I", len(raw)) + raw + compressed)
+    last_exc: Exception | None = None
+    for attempt in range(CHUNK_RETRIES):
+        try:
+            with socket.create_connection((peer_ip, peer_port),
+                                          timeout=CONNECT_TIMEOUT) as s:
+                _send_frame(s, header, compressed)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt < CHUNK_RETRIES - 1:
+                logger.warning(
+                    f"Chunk #{index} attempt {attempt + 1} failed: {exc}  – retrying…"
+                )
+                time.sleep(CHUNK_RETRY_DELAY * (attempt + 1))
+    raise ConnectionError(
+        f"Chunk #{index} failed after {CHUNK_RETRIES} attempts: {last_exc}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -476,13 +496,15 @@ class TransferServer:
         self._on_file             = on_file
         self._on_receive_progress = on_receive_progress
 
-        self._sessions: dict[str, _Session]                    = {}
-        self._pending:  dict[str, list[tuple[int, bytes, str]]] = {}
+        self._sessions:   dict[str, _Session]                    = {}
+        self._pending:    dict[str, list[tuple[int, bytes, str]]] = {}
+        self._pending_ts: dict[str, float]                        = {}  # first-chunk arrival time
         self._sess_lock = threading.Lock()
 
         self._running = False
-        self._sock: socket.socket | None    = None
-        self._thread: threading.Thread | None = None
+        self._sock:           socket.socket | None    = None
+        self._thread:         threading.Thread | None = None
+        self._cleanup_thread: threading.Thread | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────── #
 
@@ -493,10 +515,14 @@ class TransferServer:
         self._sock.listen(64)
         self._sock.settimeout(1.0)
         self._running = True
-        self._thread  = threading.Thread(
+        self._thread = threading.Thread(
             target=self._accept_loop, name="TCPAccept", daemon=True
         )
         self._thread.start()
+        self._cleanup_thread = threading.Thread(
+            target=self._pending_cleanup_loop, name="PendingCleanup", daemon=True
+        )
+        self._cleanup_thread.start()
         logger.info(f"TransferServer listening on :{self.port}")
 
     def stop(self):
@@ -567,6 +593,7 @@ class TransferServer:
         with self._sess_lock:
             self._sessions[sid] = session
             buffered = self._pending.pop(sid, [])
+            self._pending_ts.pop(sid, None)   # cancel TTL tracker
 
         tag = f"  (replaying {len(buffered)} buffered chunk(s))" if buffered else ""
         logger.debug(f"Session registered {sid[:8]}…  {rel_path}{tag}")
@@ -591,8 +618,16 @@ class TransferServer:
         with self._sess_lock:
             session = self._sessions.get(sid)
             if session is None:
-                # Session not registered yet – buffer chunk for later replay
-                self._pending.setdefault(sid, []).append((idx, compressed, sha))
+                # Session not registered yet – buffer chunk, respecting limits
+                buf = self._pending.setdefault(sid, [])
+                if len(buf) >= MAX_PENDING_PER_SESSION:
+                    logger.warning(
+                        f"Pending buffer full for session {sid[:8]}… "
+                        f"– dropping chunk #{idx}"
+                    )
+                    return
+                buf.append((idx, compressed, sha))
+                self._pending_ts.setdefault(sid, time.time())
                 logger.debug(
                     f"Chunk #{idx} buffered  session={sid[:8]}… not yet registered"
                 )
@@ -603,6 +638,25 @@ class TransferServer:
             session.add_chunk(idx, compressed, sha)
         except Exception as exc:
             logger.error(f"add_chunk error  session={sid[:8]}  idx={idx}: {exc}")
+
+    def _pending_cleanup_loop(self):
+        """Every 30 s: drop orphaned pending-chunk buffers whose TTL has expired."""
+        while self._running:
+            time.sleep(30)
+            now = time.time()
+            with self._sess_lock:
+                expired = [
+                    sid for sid, ts in self._pending_ts.items()
+                    if now - ts > PENDING_TTL
+                ]
+                for sid in expired:
+                    dropped = len(self._pending.pop(sid, []))
+                    self._pending_ts.pop(sid, None)
+                    if dropped:
+                        logger.warning(
+                            f"Dropped {dropped} orphan chunk(s) for expired "
+                            f"session {sid[:8]}… (session_init never arrived)"
+                        )
 
     def _on_done(self, session_id: str, sender_name: str,
                  path: str, elapsed: float, speed: float, size: int):

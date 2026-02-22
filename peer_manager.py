@@ -31,6 +31,11 @@ class PeerInfo:
     def is_alive(self) -> bool:
         return (time.time() - self.last_seen) < PEER_TTL_SECONDS
 
+    @property
+    def time_ago(self) -> int:
+        """Seconds since this peer was last seen."""
+        return int(time.time() - self.last_seen)
+
     def __str__(self):
         return f"{self.name} ({self.ip}:{self.port})"
 
@@ -131,14 +136,15 @@ class PeerManager:
             self._evict_stale()
 
     def _evict_stale(self):
+        # Single lock acquisition – avoids the race where a peer is refreshed
+        # between the "find stale" and "remove" phases.
         with self._lock:
-            stale = [ip for ip, p in self._peers.items() if not p.is_alive()]
-        for ip in stale:
-            with self._lock:
-                peer = self._peers.pop(ip, None)
-            if peer:
-                logger.info(f"Peer lost (TTL expired): {peer}")
-                if self._on_left:
-                    threading.Thread(
-                        target=self._on_left, args=(peer,), daemon=True
-                    ).start()
+            stale = [(ip, p) for ip, p in self._peers.items() if not p.is_alive()]
+            for ip, _ in stale:
+                self._peers.pop(ip, None)
+        for _, peer in stale:
+            logger.info(f"Peer lost (TTL expired): {peer}")
+            if self._on_left:
+                threading.Thread(
+                    target=self._on_left, args=(peer,), daemon=True
+                ).start()

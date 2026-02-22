@@ -1,5 +1,5 @@
 """
-main.py  v3
+main.py  v4
 ───────────
 Interactive CLI for LDT – LAN Data Transfer.
 
@@ -21,6 +21,8 @@ import os
 import socket as _socket
 import sys
 import threading
+import time
+from pathlib import Path
 
 from discovery import DiscoveryService
 from peer_manager import PeerManager
@@ -86,26 +88,33 @@ def on_message(sender, text):
     _prompt()
 
 
-# Tracks whether a receive-progress line is active (needs clearing)
-_recv_progress_active = threading.local()
+# Per-file receive-start timestamps for speedometer
+_recv_sessions: dict[str, float] = {}
 
 
 def on_receive_progress(received: int, total: int, sender: str, filename: str):
     """Called from receiver threads as each chunk arrives."""
     if total == 0:
         return
-    pct = min(received * 100 // total, 100)
+    key = f"{sender}/{filename}"
+    if key not in _recv_sessions:
+        _recv_sessions[key] = time.time()
+    elapsed = max(time.time() - _recv_sessions[key], 0.001)
+    speed = received / elapsed
+    pct  = min(received * 100 // total, 100)
     done = pct >= 100
     bar  = "█" * (pct // 5) + "░" * (20 - pct // 5)
     line = (
         f"\r  {DIM}[RECV]{RESET} {_c(sender, CYAN, bold=True)} → "
-        f"{filename[:22]:<22}  [{bar}] {pct:3d}%  "
-        f"{fmt_size(received)}/{fmt_size(total)}"
+        f"{filename[:18]:<18}  [{bar}] {pct:3d}%  "
+        f"{fmt_size(received)}/{fmt_size(total)}  "
+        f"{_c(fmt_size(int(speed)) + '/s', DIM)}  "
     )
     with _print_lock:
         print(line, end="", flush=True)
         if done:
-            print()   # newline when complete
+            print()
+            _recv_sessions.pop(key, None)
 
 
 def on_file(sender: str, path: str, elapsed: float, speed: float, size: int):
@@ -135,8 +144,11 @@ def cmd_peers(pm: PeerManager):
         print(f"  {YELLOW}No peers yet – waiting for broadcasts…{RESET}")
     else:
         for i, p in enumerate(peers, 1):
-            tag = f"{p.ip}:{p.port}"
-            print(f"  {BOLD}{i}.{RESET}  {_c(p.name, CYAN, bold=True):<28}  {DIM}{tag}{RESET}")
+            tag  = f"{p.ip}:{p.port}"
+            ago  = p.time_ago
+            ago_s = f"{ago}s ago" if ago < 60 else f"{ago // 60}m ago"
+            print(f"  {BOLD}{i}.{RESET}  {_c(p.name, CYAN, bold=True):<28}  "
+                  f"{DIM}{tag}   last seen {ago_s}{RESET}")
     _sep()
 
 
@@ -174,11 +186,17 @@ def cmd_send(pm: PeerManager, node_name: str):
         print(f"  Sending {_c(os.path.basename(path), CYAN)}  ({fmt_size(size)})  "
               f"→ {_c(peer.name, BOLD)} …")
 
-        def progress(sent, total):
+        _t0 = time.time()
+
+        def progress(sent, total, _t=_t0):
+            elapsed = max(time.time() - _t, 0.001)
+            speed   = sent / elapsed
             pct = min(sent * 100 // total, 100) if total else 0
             bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
             print(
-                f"\r  [{bar}] {pct:3d}%   {fmt_size(sent)}/{fmt_size(total)}",
+                f"\r  [{bar}] {pct:3d}%   "
+                f"{fmt_size(sent)}/{fmt_size(total)}  "
+                f"{_c(fmt_size(int(speed)) + '/s', DIM)}",
                 end="", flush=True,
             )
 
@@ -196,17 +214,24 @@ def cmd_send(pm: PeerManager, node_name: str):
             return
 
         name = os.path.basename(path.rstrip("/\\"))
-        file_count = sum(1 for f in __import__('pathlib').Path(path).rglob('*') if __import__('pathlib').Path(f).is_file())
-        total_sz   = sum(f.stat().st_size for f in __import__('pathlib').Path(path).rglob('*') if f.is_file())
+        folder_path_obj = Path(path)
+        file_count = sum(1 for f in folder_path_obj.rglob('*') if f.is_file())
+        total_sz   = sum(f.stat().st_size for f in folder_path_obj.rglob('*') if f.is_file())
         print(f"  Sending folder {_c(name, CYAN)}  "
               f"{_c(file_count, BOLD)} file(s)  {fmt_size(total_sz)}  → {_c(peer.name, BOLD)} …")
         print(f"  {DIM}(chunked parallel streaming – no archive created){RESET}")
 
-        def progress(sent, total):
+        _t0 = time.time()
+
+        def progress(sent, total, _t=_t0):
+            elapsed = max(time.time() - _t, 0.001)
+            speed   = sent / elapsed
             pct = min(sent * 100 // total, 100) if total else 0
             bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
             print(
-                f"\r  [{bar}] {pct:3d}%   {fmt_size(sent)}/{fmt_size(total)}",
+                f"\r  [{bar}] {pct:3d}%   "
+                f"{fmt_size(sent)}/{fmt_size(total)}  "
+                f"{_c(fmt_size(int(speed)) + '/s', DIM)}",
                 end="", flush=True,
             )
 
@@ -250,13 +275,19 @@ def cmd_help():
 # ─────────────────────────────────── main ────────────────────────────────── #
 
 def main():
-    parser = argparse.ArgumentParser(description="LDT – LAN Data Transfer v3")
-    parser.add_argument("--name", default=None, help="Node name (default: hostname)")
-    parser.add_argument("--port", type=int, default=9000, help="TCP port (default: 9000)")
+    parser = argparse.ArgumentParser(description="LDT – LAN Data Transfer v4")
+    parser.add_argument("--name",     default=None,       help="Node name (default: hostname)")
+    parser.add_argument("--port",     type=int, default=9000, help="TCP port (default: 9000)")
+    parser.add_argument("--save-dir", default="received", help="Save directory (default: received)")
+    parser.add_argument("--debug",    action="store_true",help="Enable debug logging")
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     node_name = args.name or _socket.gethostname()
     tcp_port  = args.port
+    save_dir  = args.save_dir
 
     # ── Banner ──
     print()
@@ -266,12 +297,14 @@ def main():
     print(_c("  ██║     ██║  ██║   ██║   ", CYAN, bold=True))
     print(_c("  ███████╗██████╔╝   ██║   ", CYAN, bold=True))
     print(_c("  ╚══════╝╚═════╝    ╚═╝   ", CYAN, bold=True))
-    print(_c("  LAN Data Transfer  v3", bold=True))
+    print(_c("  LAN Data Transfer  v4", bold=True))
     print()
-    print(f"  {BOLD}Node :{RESET}  {_c(node_name, CYAN, bold=True)}")
-    print(f"  {BOLD}Port :{RESET}  {tcp_port}")
+    print(f"  {BOLD}Node     :{RESET}  {_c(node_name, CYAN, bold=True)}")
+    print(f"  {BOLD}Port     :{RESET}  {tcp_port}")
+    print(f"  {BOLD}Save dir :{RESET}  {save_dir}")
     print(f"  {DIM}Compression: zlib·6   Parallel: 4   Integrity: SHA-256{RESET}")
-    print(f"  {YELLOW}Type 'help' for commands{RESET}")
+    print(f"  {BOLD}--debug  :{RESET}  {'on' if args.debug else 'off'}  "
+          f"  {YELLOW}type 'help' for commands{RESET}")
     _sep()
 
     # ── Services ──
@@ -287,7 +320,7 @@ def main():
 
     server = TransferServer(
         port=tcp_port,
-        save_dir="received",
+        save_dir=save_dir,
         on_message=on_message,
         on_file=on_file,
         on_receive_progress=on_receive_progress,
