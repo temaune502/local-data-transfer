@@ -52,14 +52,16 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE      = 2 * 1024 * 1024   # 2 MiB per chunk (uncompressed)
-MAX_PARALLEL    = 4                  # simultaneous TCP chunk connections
-# At most MAX_PARALLEL * 2 compressed chunks live in RAM simultaneously.
-# Peak sender RAM ≈ MAX_PARALLEL * 2 * CHUNK_SIZE * compression_ratio ≈ 8 MB
+MAX_PARALLEL    = 8                  # simultaneous TCP chunk connections
+# Main-thread reads raw data; workers compress + hash + send in parallel.
+# Peak RAM per sender = _MAX_INFLIGHT * CHUNK_SIZE (raw) ~ 32 MB
 _MAX_INFLIGHT   = MAX_PARALLEL * 2
-CONNECT_TIMEOUT = 10                 # seconds
+CONNECT_TIMEOUT = 5                  # seconds – shorter = faster retry on WiFi drop
+COMPRESS_LEVEL  = 1                  # zlib 1 = fast; good for incompressible data
+#   (ISO, video, etc. compress to ~100 % anyway; level 1 avoids wasting CPU)
 
 CHUNK_RETRIES       = 3     # retry attempts per chunk on network error
-CHUNK_RETRY_DELAY   = 0.5  # base delay (seconds); multiplied by attempt number
+CHUNK_RETRY_DELAY   = 0.2  # base delay (seconds); multiplied by attempt number
 
 # Pending-chunk buffer limits (guard against rogue/slow senders)
 MAX_PENDING_PER_SESSION = 256   # max buffered chunks per unknown session_id
@@ -196,21 +198,24 @@ class _Session:
                 return
             self._received.add(index)
 
-        # Decompress and persist to temp file (outside the lock – CPU+IO)
+        # Decompress (CPU-bound, outside the lock)
         decompressed = zlib.decompress(compressed)
-        chunk_file = self._tmp_dir / f"{index:08d}.chunk"
-        chunk_file.write_bytes(decompressed)
 
         with self._lock:
             self._recv_bytes += len(decompressed)
             count = len(self._received)
             rb    = self._recv_bytes
 
+        # Update progress BEFORE disk write so the display responds immediately
         if self._on_progress:
             self._on_progress(
                 min(rb, self.original_size), self.original_size,
                 self.sender_name, self.display_name,
             )
+
+        # Persist to temp file (disk I/O, after progress update)
+        chunk_file = self._tmp_dir / f"{index:08d}.chunk"
+        chunk_file.write_bytes(decompressed)
 
         if count == self.total_chunks:
             threading.Thread(target=self._finalize, daemon=True).start()
@@ -279,13 +284,15 @@ def _do_send_chunk(peer_ip: str, peer_port: int,
         try:
             with socket.create_connection((peer_ip, peer_port),
                                           timeout=CONNECT_TIMEOUT) as s:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
                 _send_frame(s, header, compressed)
             return
         except OSError as exc:
             last_exc = exc
             if attempt < CHUNK_RETRIES - 1:
                 logger.warning(
-                    f"Chunk #{index} attempt {attempt + 1} failed: {exc}  – retrying…"
+                    f"Chunk #{index} attempt {attempt + 1} failed: {exc}  - retrying..."
                 )
                 time.sleep(CHUNK_RETRY_DELAY * (attempt + 1))
     raise ConnectionError(
@@ -328,10 +335,15 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list,
                     sender_name: str, total_bytes: int, progress_cb=None):
     """
     1. Send session_init for every task (small, fast).
-    2. Stream each file's chunks in parallel, bounded by a semaphore so that
-       at most _MAX_INFLIGHT compressed chunks exist in RAM simultaneously.
+    2. Stream each file's chunks in parallel.
+
+    IMPORTANT: compression (zlib) and hashing (SHA-256) run inside the
+    worker threads, NOT on the main thread.  The main thread only reads
+    raw bytes from disk and hands them to workers, so it never blocks on
+    CPU work.  With MAX_PARALLEL=8 workers all compress+send concurrently,
+    which maximises throughput especially for incompressible files (ISO, etc.).
     """
-    # ── 1. Announce all sessions ──
+    # -- 1. Announce all sessions ----------------------------------------
     for t in tasks:
         _do_send_session_init(peer_ip, peer_port, {
             "type":          "session_init",
@@ -342,10 +354,9 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list,
             "total_chunks":  t.total_chunks,
             "sha256":        t.full_sha,
         })
-        # Small pause per session; receiver pending-buffer handles any race.
-        time.sleep(0.04)
+        time.sleep(0.04)   # receiver pending-buffer handles any race
 
-    # ── 2. Bounded-memory parallel chunk streaming ──
+    # -- 2. Parallel chunk streaming (compress+send in workers) ----------
     sent = [0]
     lock     = threading.Lock()
     inflight = threading.Semaphore(_MAX_INFLIGHT)   # bounds RAM
@@ -355,14 +366,14 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list,
 
         for t in tasks:
             if t.file_size == 0:
-                # Empty file: send one empty compressed chunk
+                # Empty file: one empty chunk, compression in worker
                 inflight.acquire()
-                comp = zlib.compress(b"", level=6)
-                sha  = _sha256_bytes(comp)
 
-                def _empty(sid=t.session_id, c=comp, s=sha):
+                def _empty(sid=t.session_id):
                     try:
-                        _do_send_chunk(peer_ip, peer_port, sid, 0, c, s)
+                        comp = zlib.compress(b"", level=COMPRESS_LEVEL)
+                        sha  = _sha256_bytes(comp)
+                        _do_send_chunk(peer_ip, peer_port, sid, 0, comp, sha)
                     finally:
                         inflight.release()
 
@@ -371,19 +382,20 @@ def _dispatch_tasks(peer_ip: str, peer_port: int, tasks: list,
                 with open(t.path, "rb") as f:
                     idx = 0
                     while True:
+                        # Throttle: read next chunk only when a slot is free
                         inflight.acquire()
                         raw = f.read(CHUNK_SIZE)
                         if not raw:
                             inflight.release()
                             break
-                        comp = zlib.compress(raw, level=6)
-                        sha  = _sha256_bytes(comp)
                         orig = len(raw)
 
-                        def _chunk(sid=t.session_id, i=idx,
-                                   c=comp, s=sha, o=orig):
+                        # raw captured by closure; compress+hash done in worker
+                        def _chunk(sid=t.session_id, i=idx, r=raw, o=orig):
                             try:
-                                _do_send_chunk(peer_ip, peer_port, sid, i, c, s)
+                                comp = zlib.compress(r, level=COMPRESS_LEVEL)
+                                sha  = _sha256_bytes(comp)
+                                _do_send_chunk(peer_ip, peer_port, sid, i, comp, sha)
                                 with lock:
                                     sent[0] = min(sent[0] + o, total_bytes)
                                     if progress_cb:

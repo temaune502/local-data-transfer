@@ -81,15 +81,25 @@ def _prompt():
 # ---------------------------- Argument parser ------------------------------ #
 
 def _parse_cmd(line: str) -> list[str]:
-    """
-    Shell-style tokeniser – handles quoted paths with spaces.
-    Falls back to simple split on shlex errors (e.g. unclosed quote).
-    Uses posix=True so surrounding quotes are stripped for you.
+    r"""
+    Shell-style tokeniser that handles Windows backslash paths correctly.
+
+    Uses posix=False so backslashes are NOT treated as escape characters
+    (critical for Windows paths like E:\History\file.iso).
+    Surrounding quotes are stripped manually after splitting.
     """
     try:
-        return shlex.split(line, posix=True)
+        tokens = shlex.split(line, posix=False)
     except ValueError:
         return line.split()
+    # Strip surrounding double or single quotes from each token
+    result = []
+    for t in tokens:
+        if len(t) >= 2 and ((t[0] == '"' and t[-1] == '"')
+                            or (t[0] == "'" and t[-1] == "'")):
+            t = t[1:-1]
+        result.append(t)
+    return result
 
 
 # --------------------------- Event callbacks ------------------------------- #
