@@ -36,12 +36,7 @@ from discovery import DiscoveryService
 from peer_manager import PeerManager
 from transfer import TransferServer, fmt_size, send_file, send_folder, send_message
 
-# --------------------------- logging --------------------------------------- #
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(levelname)s  %(name)s: %(message)s",
-)
+# Replaced by _ProgressAwareHandler below (must be after _print_lock is defined)
 
 # --------------------------- ANSI colours ---------------------------------- #
 
@@ -76,6 +71,34 @@ def _safe_print(*args, end="\n", flush=False):
 def _prompt():
     with _print_lock:
         print("ldt> ", end="", flush=True)
+
+
+# ---- Logging handler that never clobbers the progress bar ---------------- #
+
+class _ProgressAwareHandler(logging.StreamHandler):
+    """
+    Custom handler: acquires _print_lock before writing, so log messages
+    always appear on their own line and never merge with \\r progress bars.
+    """
+    def emit(self, record):
+        with _print_lock:
+            try:
+                msg = self.format(record)
+                # Move to a fresh line in case a \r progress bar is active
+                sys.stdout.write("\n" + msg + "\n")
+                sys.stdout.flush()
+            except Exception:
+                self.handleError(record)
+
+
+# Configure root logger once (after _print_lock is defined)
+_log_handler = _ProgressAwareHandler()
+_log_handler.setFormatter(
+    logging.Formatter("%(levelname)s  %(name)s: %(message)s")
+)
+logging.getLogger().handlers.clear()     # remove any basicConfig handlers
+logging.getLogger().addHandler(_log_handler)
+logging.getLogger().setLevel(logging.WARNING)
 
 
 # ---------------------------- Argument parser ------------------------------ #
@@ -120,7 +143,11 @@ def on_message(sender, text):
 
 
 # Per-file receive-start timestamps for speedometer
-_recv_sessions: dict[str, float] = {}
+_recv_sessions:   dict[str, float] = {}
+# Rate-limit: only refresh the display at most 10 times/second per file
+_recv_last_print: dict[str, float] = {}
+
+_RECV_RATE_LIMIT = 0.10   # seconds between display refreshes
 
 
 def on_receive_progress(received: int, total: int, sender: str, filename: str):
@@ -128,12 +155,22 @@ def on_receive_progress(received: int, total: int, sender: str, filename: str):
     if total == 0:
         return
     key = f"{sender}/{filename}"
+    now = time.time()
+
+    # Initialise per-file start time
     if key not in _recv_sessions:
-        _recv_sessions[key] = time.time()
-    elapsed = max(time.time() - _recv_sessions[key], 0.001)
+        _recv_sessions[key] = now
+
+    done = received >= total
+
+    # Rate-limit: skip intermediate updates if printed recently
+    if not done and now - _recv_last_print.get(key, 0) < _RECV_RATE_LIMIT:
+        return
+    _recv_last_print[key] = now
+
+    elapsed = max(now - _recv_sessions[key], 0.001)
     speed = received / elapsed
     pct  = min(received * 100 // total, 100)
-    done = pct >= 100
     bar  = "#" * (pct // 5) + "-" * (20 - pct // 5)
     line = (
         f"\r  {DIM}[RECV]{RESET} {_c(sender, CYAN, bold=True)} -> "
@@ -146,6 +183,7 @@ def on_receive_progress(received: int, total: int, sender: str, filename: str):
         if done:
             print()
             _recv_sessions.pop(key, None)
+            _recv_last_print.pop(key, None)
 
 
 def on_file(sender: str, path: str, elapsed: float, speed: float, size: int):
@@ -237,6 +275,14 @@ def cmd_send(pm: PeerManager, node_name: str,
         size = os.path.getsize(path)
         print(f"  Sending {_c(os.path.basename(path), CYAN)}  ({fmt_size(size)})  "
               f"-> {_c(peer.name, BOLD)} ...")
+
+        # For large files: SHA-256 pre-scan can take several seconds.
+        # Show a "Preparing" indicator so the user knows it's not frozen.
+        _LARGE = 50 * 1024 * 1024   # 50 MB
+        if size > _LARGE:
+            print(f"  {DIM}Computing SHA-256 checksum ({fmt_size(size)})..."
+                  f" please wait{RESET}",
+                  end="", flush=True)
 
         _t0 = time.time()
 
