@@ -1,23 +1,31 @@
 """
-main.py  v4
-───────────
+main.py  v5
+-----------
 Interactive CLI for LDT – LAN Data Transfer.
 
-Commands
-─────────
-  peers          – List active peers
-  send           – Send a file, folder, or message
-  help           – Show help
-  quit / exit    – Quit
+Commands (interactive):
+  peers         – List active peers
+  send          – Interactive send wizard
+  help          – Show help
+  quit / exit   – Quit
 
-Usage
-─────
+Inline send syntax (no prompts):
+  send <peer#> f <path>        – File
+  send <peer#> d <folder>      – Directory
+  send <peer#> m <text>        – Message
+
+Command chaining (semicolon-separated):
+  send 1 f "a.txt"; send 1 f "b.txt"; peers
+
+Usage:
   python main.py [--name <name>] [--port <port>]
+                 [--save-dir <dir>] [--debug]
 """
 
 import argparse
 import logging
 import os
+import shlex
 import socket as _socket
 import sys
 import threading
@@ -28,21 +36,20 @@ from discovery import DiscoveryService
 from peer_manager import PeerManager
 from transfer import TransferServer, fmt_size, send_file, send_folder, send_message
 
-# ─────────────────────────── logging ─────────────────────────────────────── #
+# --------------------------- logging --------------------------------------- #
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(levelname)s  %(name)s: %(message)s",
 )
 
-# ─────────────────────────── ANSI colours ────────────────────────────────── #
+# --------------------------- ANSI colours ---------------------------------- #
 
 os.system("")   # enable ANSI codes on Windows
 CYAN   = "\033[96m"
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 RED    = "\033[91m"
-MAGENTA= "\033[95m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 RESET  = "\033[0m"
@@ -53,10 +60,10 @@ def _c(text, color="", bold=False) -> str:
 
 
 def _sep():
-    print("─" * 58)
+    print("-" * 60)
 
 
-# ─────────────────────── thread-safe print helpers ───────────────────────── #
+# ----------------------- thread-safe print helpers ------------------------- #
 
 _print_lock = threading.Lock()
 
@@ -71,7 +78,21 @@ def _prompt():
         print("ldt> ", end="", flush=True)
 
 
-# ─────────────────────────── Event callbacks ─────────────────────────────── #
+# ---------------------------- Argument parser ------------------------------ #
+
+def _parse_cmd(line: str) -> list[str]:
+    """
+    Shell-style tokeniser – handles quoted paths with spaces.
+    Falls back to simple split on shlex errors (e.g. unclosed quote).
+    Uses posix=True so surrounding quotes are stripped for you.
+    """
+    try:
+        return shlex.split(line, posix=True)
+    except ValueError:
+        return line.split()
+
+
+# --------------------------- Event callbacks ------------------------------- #
 
 def on_peer_joined(peer):
     _safe_print(f"\n{GREEN}[+] Peer joined : {peer}{RESET}")
@@ -103,9 +124,9 @@ def on_receive_progress(received: int, total: int, sender: str, filename: str):
     speed = received / elapsed
     pct  = min(received * 100 // total, 100)
     done = pct >= 100
-    bar  = "█" * (pct // 5) + "░" * (20 - pct // 5)
+    bar  = "#" * (pct // 5) + "-" * (20 - pct // 5)
     line = (
-        f"\r  {DIM}[RECV]{RESET} {_c(sender, CYAN, bold=True)} → "
+        f"\r  {DIM}[RECV]{RESET} {_c(sender, CYAN, bold=True)} -> "
         f"{filename[:18]:<18}  [{bar}] {pct:3d}%  "
         f"{fmt_size(received)}/{fmt_size(total)}  "
         f"{_c(fmt_size(int(speed)) + '/s', DIM)}  "
@@ -121,70 +142,91 @@ def on_file(sender: str, path: str, elapsed: float, speed: float, size: int):
     """Called after a transfer is fully assembled and verified."""
     name = os.path.basename(path)
     with _print_lock:
-        print()  # ensure fresh line after any progress output
-        print(
-            f"\n{GREEN}[FILE ✓] {BOLD}{sender}{RESET}{GREEN} → {name}{RESET}"
-        )
-        print(
-            f"   {DIM}Saved : {path}{RESET}"
-        )
-        print(
-            f"   {DIM}Size  : {fmt_size(size)}  in {elapsed:.1f}s  "
-            f"@ {fmt_size(int(speed))}/s{RESET}"
-        )
+        print()
+        print(f"\n{GREEN}[FILE OK] {BOLD}{sender}{RESET}{GREEN} -> {name}{RESET}")
+        print(f"   {DIM}Saved : {path}{RESET}")
+        print(f"   {DIM}Size  : {fmt_size(size)}  in {elapsed:.1f}s  "
+              f"@ {fmt_size(int(speed))}/s{RESET}")
     _prompt()
 
 
-# ────────────────────────────── CLI commands ─────────────────────────────── #
+# ------------------------------ CLI commands ------------------------------- #
 
 def cmd_peers(pm: PeerManager):
     peers = pm.get_peers()
     _sep()
     if not peers:
-        print(f"  {YELLOW}No peers yet – waiting for broadcasts…{RESET}")
+        print(f"  {YELLOW}No peers yet – waiting for broadcasts...{RESET}")
     else:
         for i, p in enumerate(peers, 1):
-            tag  = f"{p.ip}:{p.port}"
-            ago  = p.time_ago
+            tag   = f"{p.ip}:{p.port}"
+            ago   = p.time_ago
             ago_s = f"{ago}s ago" if ago < 60 else f"{ago // 60}m ago"
             print(f"  {BOLD}{i}.{RESET}  {_c(p.name, CYAN, bold=True):<28}  "
                   f"{DIM}{tag}   last seen {ago_s}{RESET}")
     _sep()
 
 
-def cmd_send(pm: PeerManager, node_name: str):
+def cmd_send(pm: PeerManager, node_name: str,
+             inline_args: list[str] | None = None):
+    """
+    Send a file, folder, or message.
+
+    Inline mode  – all args supplied on the command line (no prompts):
+      send 1 f "C:\\path\\file.txt"
+      send 2 d /my/folder
+      send 1 m Hello world
+
+    Interactive – any missing arg falls back to a prompt.
+    """
     peers = pm.get_peers()
     if not peers:
         print(f"  {YELLOW}No peers available.{RESET}")
         return
 
-    # ── choose peer ──
-    _sep()
-    for i, p in enumerate(peers, 1):
-        print(f"  {i}.  {_c(p.name, CYAN)}  {DIM}({p.ip}:{p.port}){RESET}")
-    _sep()
-    raw = input("Select peer (number) or [c]ancel: ").strip()
-    if raw.lower() == "c":
-        return
-    try:
-        peer = peers[int(raw) - 1]
-    except (ValueError, IndexError):
-        print(f"  {RED}Invalid selection.{RESET}")
-        return
+    args = list(inline_args) if inline_args else []
 
-    # ── choose type ──
-    kind = input("Send [f]ile, [d]irectory, or [m]essage? ").strip().lower()
+    # -- 1. Peer ---------------------------------------------------------
+    if args and args[0].isdigit():
+        idx = int(args.pop(0)) - 1
+        if not (0 <= idx < len(peers)):
+            print(f"  {RED}Peer #{idx + 1} not found. Use 'peers' to list.{RESET}")
+            return
+        peer = peers[idx]
+    else:
+        _sep()
+        for i, p in enumerate(peers, 1):
+            print(f"  {i}.  {_c(p.name, CYAN)}  {DIM}({p.ip}:{p.port}){RESET}")
+        _sep()
+        raw = input("Select peer (number) or [c]ancel: ").strip()
+        if raw.lower() == "c":
+            return
+        try:
+            peer = peers[int(raw) - 1]
+        except (ValueError, IndexError):
+            print(f"  {RED}Invalid selection.{RESET}")
+            return
 
-    # ─────── file ───────
+    # -- 2. Type ---------------------------------------------------------
+    if args:
+        kind = args.pop(0).lower()
+    else:
+        kind = input("Send [f]ile, [d]irectory, or [m]essage? ").strip().lower()
+
+    # -- 3. Path / text --------------------------------------------------
+    # Join remaining tokens to support unquoted paths with spaces
+    inline_val = " ".join(args).strip().strip('"').strip("'") if args else None
+
+    # --- file ------------------------------------------------------------
     if kind in ("f", "file"):
-        path = input("File path: ").strip().strip('"').strip("'")
+        path = inline_val or input("File path: ").strip().strip('"').strip("'")
         if not os.path.isfile(path):
             print(f"  {RED}File not found: {path}{RESET}")
             return
 
         size = os.path.getsize(path)
         print(f"  Sending {_c(os.path.basename(path), CYAN)}  ({fmt_size(size)})  "
-              f"→ {_c(peer.name, BOLD)} …")
+              f"-> {_c(peer.name, BOLD)} ...")
 
         _t0 = time.time()
 
@@ -192,7 +234,7 @@ def cmd_send(pm: PeerManager, node_name: str):
             elapsed = max(time.time() - _t, 0.001)
             speed   = sent / elapsed
             pct = min(sent * 100 // total, 100) if total else 0
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
             print(
                 f"\r  [{bar}] {pct:3d}%   "
                 f"{fmt_size(sent)}/{fmt_size(total)}  "
@@ -202,23 +244,24 @@ def cmd_send(pm: PeerManager, node_name: str):
 
         try:
             send_file(peer.ip, peer.port, path, node_name, progress_cb=progress)
-            print(f"\n  {GREEN}✓ Sent successfully.{RESET}")
+            print(f"\n  {GREEN}OK Sent successfully.{RESET}")
         except Exception as exc:
-            print(f"\n  {RED}✗ Error: {exc}{RESET}")
+            print(f"\n  {RED}ERR Error: {exc}{RESET}")
 
-    # ─────── directory ───────
+    # --- directory -------------------------------------------------------
     elif kind in ("d", "dir", "directory", "folder"):
-        path = input("Folder path: ").strip().strip('"').strip("'")
+        path = inline_val or input("Folder path: ").strip().strip('"').strip("'")
         if not os.path.isdir(path):
             print(f"  {RED}Directory not found: {path}{RESET}")
             return
 
-        name = os.path.basename(path.rstrip("/\\"))
-        folder_path_obj = Path(path)
-        file_count = sum(1 for f in folder_path_obj.rglob('*') if f.is_file())
-        total_sz   = sum(f.stat().st_size for f in folder_path_obj.rglob('*') if f.is_file())
+        name          = os.path.basename(path.rstrip("/\\"))
+        folder_p      = Path(path)
+        file_count    = sum(1 for f in folder_p.rglob("*") if f.is_file())
+        total_sz      = sum(f.stat().st_size for f in folder_p.rglob("*") if f.is_file())
         print(f"  Sending folder {_c(name, CYAN)}  "
-              f"{_c(file_count, BOLD)} file(s)  {fmt_size(total_sz)}  → {_c(peer.name, BOLD)} …")
+              f"{_c(file_count, BOLD)} file(s)  {fmt_size(total_sz)}  "
+              f"-> {_c(peer.name, BOLD)} ...")
         print(f"  {DIM}(chunked parallel streaming – no archive created){RESET}")
 
         _t0 = time.time()
@@ -227,7 +270,7 @@ def cmd_send(pm: PeerManager, node_name: str):
             elapsed = max(time.time() - _t, 0.001)
             speed   = sent / elapsed
             pct = min(sent * 100 // total, 100) if total else 0
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
             print(
                 f"\r  [{bar}] {pct:3d}%   "
                 f"{fmt_size(sent)}/{fmt_size(total)}  "
@@ -237,49 +280,86 @@ def cmd_send(pm: PeerManager, node_name: str):
 
         try:
             send_folder(peer.ip, peer.port, path, node_name, progress_cb=progress)
-            print(f"\n  {GREEN}✓ Folder sent successfully.{RESET}")
+            print(f"\n  {GREEN}OK Folder sent successfully.{RESET}")
         except Exception as exc:
-            print(f"\n  {RED}✗ Error: {exc}{RESET}")
+            print(f"\n  {RED}ERR Error: {exc}{RESET}")
 
-    # ─────── message ───────
+    # --- message ---------------------------------------------------------
     elif kind in ("m", "message", "msg"):
-        text = input("Message: ").strip()
+        text = inline_val or input("Message: ").strip()
         if not text:
             return
         try:
             send_message(peer.ip, peer.port, text, node_name)
-            print(f"  {GREEN}✓ Message sent.{RESET}")
+            print(f"  {GREEN}OK Message sent.{RESET}")
         except Exception as exc:
-            print(f"  {RED}✗ Error: {exc}{RESET}")
+            print(f"  {RED}ERR Error: {exc}{RESET}")
+
     else:
-        print(f"  {YELLOW}Use 'f', 'd', or 'm'.{RESET}")
+        print(f"  {YELLOW}Unknown type '{kind}'. Use 'f', 'd', or 'm'.{RESET}")
 
 
 def cmd_help():
     _sep()
-    print(f"  {BOLD}Commands:{RESET}")
-    print(f"  {CYAN}peers{RESET}   – Show active peers")
-    print(f"  {CYAN}send{RESET}    – Send file / folder / message")
-    print(f"  {CYAN}help{RESET}    – This help")
-    print(f"  {CYAN}quit{RESET}    – Exit")
+    print(f"  {BOLD}Basic commands:{RESET}")
+    print(f"  {CYAN}peers{RESET}     – List active peers (with last-seen time)")
+    print(f"  {CYAN}send{RESET}      – Interactive send wizard")
+    print(f"  {CYAN}help{RESET}      – This help")
+    print(f"  {CYAN}quit{RESET}      – Exit")
     _sep()
-    print(f"  {BOLD}Transfer features:{RESET}")
-    print(f"  {DIM}• zlib compression (level 6) per chunk{RESET}")
-    print(f"  {DIM}• 4 parallel chunk streams{RESET}")
-    print(f"  {DIM}• SHA-256 integrity: per-chunk + full-file{RESET}")
-    print(f"  {DIM}• Folder: per-file chunked parallel streaming (no zip){RESET}")
-    print(f"  {DIM}• Received files saved to: received/{RESET}")
+    print(f"  {BOLD}Inline send:{RESET}  {DIM}send <peer#> <type> <path/text>{RESET}")
+    print(f"  {CYAN}send 1 f{RESET} {DIM}\"C:\\path\\file.txt\"{RESET}   – send file to peer 1")
+    print(f"  {CYAN}send 2 d{RESET} {DIM}/my/folder{RESET}             – send folder to peer 2")
+    print(f"  {CYAN}send 1 m{RESET} {DIM}Hello world{RESET}            – send message to peer 1")
+    _sep()
+    print(f"  {BOLD}Command chaining{RESET}  {DIM}(separate with ;){RESET}")
+    print(f'  {DIM}send 1 f "a.txt"; send 1 f "b.txt"; peers{RESET}')
+    _sep()
+    print(f"  {BOLD}Transfer engine:{RESET}")
+    print(f"  {DIM}* zlib compression (level 6) per chunk{RESET}")
+    print(f"  {DIM}* 4 parallel chunk streams with retry (3×){RESET}")
+    print(f"  {DIM}* SHA-256 integrity: per-chunk + full-file{RESET}")
+    print(f"  {DIM}* Folder: per-file streaming (no zip){RESET}")
+    print(f"  {DIM}* Received files saved to: <save-dir>/{RESET}")
     _sep()
 
 
-# ─────────────────────────────────── main ────────────────────────────────── #
+# -------------------- command dispatcher ----------------------------------- #
+
+def _run_cmd(cmd_str: str, pm: PeerManager, node_name: str) -> bool:
+    """
+    Parse and execute a single command string.
+    Returns True if the application should quit.
+    """
+    tokens = _parse_cmd(cmd_str)
+    if not tokens:
+        return False
+
+    cmd        = tokens[0].lower()
+    extra_args = tokens[1:]
+
+    if cmd in ("quit", "exit", "q"):
+        return True
+    elif cmd in ("peers", "p"):
+        cmd_peers(pm)
+    elif cmd in ("send", "s"):
+        cmd_send(pm, node_name, extra_args if extra_args else None)
+    elif cmd in ("help", "h", "?"):
+        cmd_help()
+    else:
+        print(f"  {YELLOW}Unknown command '{cmd}'. Type 'help'.{RESET}")
+
+    return False
+
+
+# ----------------------------------- main ---------------------------------- #
 
 def main():
-    parser = argparse.ArgumentParser(description="LDT – LAN Data Transfer v4")
+    parser = argparse.ArgumentParser(description="LDT – LAN Data Transfer v5")
     parser.add_argument("--name",     default=None,       help="Node name (default: hostname)")
     parser.add_argument("--port",     type=int, default=9000, help="TCP port (default: 9000)")
     parser.add_argument("--save-dir", default="received", help="Save directory (default: received)")
-    parser.add_argument("--debug",    action="store_true",help="Enable debug logging")
+    parser.add_argument("--debug",    action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     if args.debug:
@@ -289,25 +369,25 @@ def main():
     tcp_port  = args.port
     save_dir  = args.save_dir
 
-    # ── Banner ──
+    # -- Banner --
     print()
-    print(_c("  ██╗     ██████╗ ████████╗", CYAN, bold=True))
-    print(_c("  ██║     ██╔══██╗╚══██╔══╝", CYAN, bold=True))
-    print(_c("  ██║     ██║  ██║   ██║   ", CYAN, bold=True))
-    print(_c("  ██║     ██║  ██║   ██║   ", CYAN, bold=True))
-    print(_c("  ███████╗██████╔╝   ██║   ", CYAN, bold=True))
+    print(_c("  ##╗     ######╗ ########╗", CYAN, bold=True))
+    print(_c("  ##║     ##╔══##╗╚══##╔══╝", CYAN, bold=True))
+    print(_c("  ##║     ##║  ##║   ##║   ", CYAN, bold=True))
+    print(_c("  ##║     ##║  ##║   ##║   ", CYAN, bold=True))
+    print(_c("  #######╗######╔╝   ##║   ", CYAN, bold=True))
     print(_c("  ╚══════╝╚═════╝    ╚═╝   ", CYAN, bold=True))
-    print(_c("  LAN Data Transfer  v4", bold=True))
+    print(_c("  LAN Data Transfer  v5", bold=True))
     print()
     print(f"  {BOLD}Node     :{RESET}  {_c(node_name, CYAN, bold=True)}")
     print(f"  {BOLD}Port     :{RESET}  {tcp_port}")
     print(f"  {BOLD}Save dir :{RESET}  {save_dir}")
-    print(f"  {DIM}Compression: zlib·6   Parallel: 4   Integrity: SHA-256{RESET}")
+    print(f"  {DIM}Compression: zlib.6   Parallel: 4   Integrity: SHA-256{RESET}")
     print(f"  {BOLD}--debug  :{RESET}  {'on' if args.debug else 'off'}  "
           f"  {YELLOW}type 'help' for commands{RESET}")
     _sep()
 
-    # ── Services ──
+    # -- Services --
     pm = PeerManager(on_peer_joined=on_peer_joined, on_peer_left=on_peer_left)
     pm.start()
 
@@ -332,31 +412,33 @@ def main():
         print(f"{YELLOW}Hint: port {tcp_port} may be in use. Try --port <other>{RESET}")
         sys.exit(1)
 
-    # ── REPL ──
+    # -- REPL --
     try:
         while True:
             try:
-                cmd = input("ldt> ").strip().lower()
+                raw_line = input("ldt> ").strip()
             except EOFError:
                 break
 
-            if cmd in ("quit", "exit", "q"):
+            if not raw_line:
+                continue
+
+            # Semicolon chaining: "send 1 f a.txt; send 1 f b.txt; peers"
+            cmd_parts = [c.strip() for c in raw_line.split(";") if c.strip()]
+            should_quit = False
+
+            for cmd_str in cmd_parts:
+                if _run_cmd(cmd_str, pm, node_name):
+                    should_quit = True
+                    break
+
+            if should_quit:
                 break
-            elif cmd in ("peers", "p"):
-                cmd_peers(pm)
-            elif cmd in ("send", "s"):
-                cmd_send(pm, node_name)
-            elif cmd in ("help", "h", "?"):
-                cmd_help()
-            elif cmd == "":
-                pass
-            else:
-                print(f"  {YELLOW}Unknown command '{cmd}'. Type 'help'.{RESET}")
 
     except KeyboardInterrupt:
         pass
     finally:
-        print(f"\n{DIM}Shutting down…{RESET}")
+        print(f"\n{DIM}Shutting down...{RESET}")
         discovery.stop()
         server.stop()
         pm.stop()
