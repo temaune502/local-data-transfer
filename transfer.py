@@ -172,11 +172,12 @@ class _Session:
         self._on_complete  = on_complete
         self._on_progress  = on_progress
 
-        # Received chunk indices (lightweight, just ints)
-        self._received: set[int] = set()
-        self._recv_bytes = 0
-        self._lock       = threading.Lock()
-        self._created_at = time.time()
+        # Received chunk indices – used ONLY for deduplication
+        self._received:     set[int] = set()
+        self._recv_bytes  = 0
+        self._written_count = 0          # incremented AFTER chunk file is on disk
+        self._lock        = threading.Lock()
+        self._created_at  = time.time()
 
         # Each chunk is stored as a separate temp file: <tmp_dir>/<index:08d>.chunk
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="ldt_rx_"))
@@ -192,32 +193,43 @@ class _Session:
                 f"  expected {chunk_sha256[:12]}…  got {actual[:12]}…"
             )
 
-        # Deduplicate before decompression
+        # Deduplicate before decompression (Lock A)
         with self._lock:
             if index in self._received:
                 return
             self._received.add(index)
 
-        # Decompress (CPU-bound, outside the lock)
+        # Decompress (CPU-bound, outside any lock)
         decompressed = zlib.decompress(compressed)
 
+        # Update progress counter (Lock B)
         with self._lock:
             self._recv_bytes += len(decompressed)
-            count = len(self._received)
-            rb    = self._recv_bytes
+            rb = self._recv_bytes
 
-        # Update progress BEFORE disk write so the display responds immediately
+        # Update display BEFORE disk write so the bar responds immediately
         if self._on_progress:
             self._on_progress(
                 min(rb, self.original_size), self.original_size,
                 self.sender_name, self.display_name,
             )
 
-        # Persist to temp file (disk I/O, after progress update)
+        # Write chunk to disk  ─────────────────────────────────────────────
+        # THIS must happen BEFORE we increment _written_count, so that when
+        # _written_count reaches total_chunks every file is guaranteed to exist.
         chunk_file = self._tmp_dir / f"{index:08d}.chunk"
         chunk_file.write_bytes(decompressed)
 
-        if count == self.total_chunks:
+        # Increment the "safely written" counter (Lock C)
+        # Finalize is triggered only here, ensuring all chunk files are on disk
+        # before _finalize tries to read them.  Using a separate counter (not
+        # len(_received)) closes the race where another thread could start
+        # _finalize while this thread's write_bytes() is still in progress.
+        with self._lock:
+            self._written_count += 1
+            all_done = self._written_count == self.total_chunks
+
+        if all_done:
             threading.Thread(target=self._finalize, daemon=True).start()
 
     # ── private ────────────────────────────────────────────────────────── #
